@@ -8,5 +8,6 @@ PWD := $(shell pwd)
 
 all:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf-
+	arm-linux-gnueabihf-gcc -o test_lis3dh test/test_lis3dh.c -I./
 clean:
 	-rm -rf *.o *.ko *.mod.c .*.cmd .tmp_versions Module.symvers modules.order 
