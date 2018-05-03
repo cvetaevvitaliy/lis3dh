@@ -108,6 +108,7 @@ static int lis3dh_acc_i2c_probe(struct i2c_client *client,
 	stat->name = client->name;
 	stat->bustype = BUS_I2C;
 	stat->tf = &lis3dh_acc_tf_i2c;
+    
 	i2c_set_clientdata(client, stat);
 
 	err = lis3dh_acc_probe(stat, client->irq);

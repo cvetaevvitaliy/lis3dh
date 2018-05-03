@@ -66,11 +66,28 @@ Version History.
 #include <linux/interrupt.h>
 #include <linux/slab.h>
 #include <linux/kernel.h>
+#include <linux/poll.h>   //poll  
 #include <linux/device.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 
 #include "lis3dh.h"
+#include "lis3dhlib.h"
+
+#define DRIVER_VER1     0
+#define DRIVER_VER2     4
+#define DRV_MAJOR       104
+#define DRV_MINOR       1
+
+#undef	DEBUG
+//#define DEBUG
+#ifdef DEBUG
+#define	DPRINTK( x... )		printk("lis3dh_drv: " x)
+#else
+#define DPRINTK( x... )
+#endif
+
+
 
 #define LIS3DH_EN_OPEN_CLOSE
 
@@ -204,6 +221,11 @@ Version History.
 #define	RES_REFERENCE_REG	15
 #define	RES_FIFO_CTRL_REG	16
 
+
+#define VERSION1
+#define VERSION2
+
+
 /* end RESUME STATE INDICES */
 
 struct {
@@ -222,6 +244,9 @@ struct {
 
 static int int1_gpio = LIS3DH_ACC_DEFAULT_INT1_GPIO;
 static int int2_gpio = LIS3DH_ACC_DEFAULT_INT2_GPIO;
+static struct lis3dh_acc_status *lis3dh_ptr = NULL;
+
+
 module_param(int1_gpio, int, S_IRUGO);
 module_param(int2_gpio, int, S_IRUGO);
 
@@ -442,16 +467,6 @@ error:
 	return err;
 }
 
-static int lis3dh_acc_register_write(struct lis3dh_acc_status *stat,
-				     u8 *buf, u8 reg_address, u8 new_value)
-{
-	/* Sets configuration register at reg_address
-	 *  NOTE: this is a straight overwrite  */
-	buf[0] = new_value;
-
-	return stat->tf->write(stat, reg_address, 1, buf);
-}
-
 static int lis3dh_acc_get_acceleration_data(struct lis3dh_acc_status *stat,
 					    int *xyz)
 {
@@ -483,19 +498,6 @@ static int lis3dh_acc_get_acceleration_data(struct lis3dh_acc_status *stat,
 	return err;
 }
 
-/* Input events chenged to EV_MSC */
-static void lis3dh_acc_report_values(struct lis3dh_acc_status *stat,
-				     int *xyz, int64_t timestamp)
-{
-	input_event(stat->input_dev, INPUT_EVENT_TYPE, INPUT_EVENT_X, xyz[0]);
-	input_event(stat->input_dev, INPUT_EVENT_TYPE, INPUT_EVENT_Y, xyz[1]);
-	input_event(stat->input_dev, INPUT_EVENT_TYPE, INPUT_EVENT_Z, xyz[2]);
-	input_event(stat->input_dev, INPUT_EVENT_TYPE, INPUT_EVENT_TIME_MSB,
-		    timestamp >> 32);
-	input_event(stat->input_dev, INPUT_EVENT_TYPE, INPUT_EVENT_TIME_LSB,
-		    timestamp & 0xffffffff);
-	input_sync(stat->input_dev);
-}
 
 static int lis3dh_acc_enable(struct lis3dh_acc_status *stat)
 {
@@ -524,357 +526,6 @@ static int lis3dh_acc_disable(struct lis3dh_acc_status *stat)
 
 	return 0;
 }
-
-static ssize_t read_single_reg(struct device *dev, char *buf, u8 reg)
-{
-	ssize_t ret;
-	struct lis3dh_acc_status *stat = dev_get_drvdata(dev);
-	int err;
-	u8 data;
-
-	err = stat->tf->read(stat, reg, 1, &data);
-	if (err < 0)
-		return err;
-
-	ret = sprintf(buf, "0x%02x\n", data);
-
-	return ret;
-}
-
-static int write_reg(struct device *dev, const char *buf, u8 reg,
-		     u8 mask, int resumeIndex)
-{
-	int err = -1;
-	struct lis3dh_acc_status *stat = dev_get_drvdata(dev);
-	u8 x[2];
-	u8 new_val;
-	unsigned long val;
-
-	if (kstrtoul(buf, 16, &val))
-		return -EINVAL;
-
-	new_val = ((u8) val & mask);
-	x[0] = reg;
-	x[1] = new_val;
-	err = lis3dh_acc_register_write(stat, x, reg, new_val);
-	if (err >= 0)
-		stat->resume_state[resumeIndex] = new_val;
-
-	return err;
-}
-
-static ssize_t attr_get_polling_rate(struct device *dev,
-				     struct device_attribute *attr,
-				     char *buf)
-{
-	int val;
-	struct lis3dh_acc_status *stat = dev_get_drvdata(dev);
-
-	mutex_lock(&stat->lock);
-	val = stat->pdata->poll_interval;
-	mutex_unlock(&stat->lock);
-
-	return sprintf(buf, "%d\n", val);
-}
-
-static ssize_t attr_set_polling_rate(struct device *dev,
-				     struct device_attribute *attr,
-				     const char *buf, size_t size)
-{
-	struct lis3dh_acc_status *stat = dev_get_drvdata(dev);
-	unsigned long interval_ms;
-
-	if (kstrtoul(buf, 10, &interval_ms))
-		return -EINVAL;
-
-	if (!interval_ms)
-		return -EINVAL;
-
-	interval_ms = max((unsigned int)interval_ms, stat->pdata->min_interval);
-	mutex_lock(&stat->lock);
-	stat->pdata->poll_interval = interval_ms;
-	lis3dh_acc_update_odr(stat, interval_ms);
-	mutex_unlock(&stat->lock);
-
-	return size;
-}
-
-static ssize_t attr_get_range(struct device *dev,
-			      struct device_attribute *attr, char *buf)
-{
-	char val;
-	struct lis3dh_acc_status *stat = dev_get_drvdata(dev);
-	char range = 2;
-
-	mutex_lock(&stat->lock);
-	val = stat->pdata->fs_range ;
-	switch (val) {
-	case LIS3DH_ACC_G_2G:
-		range = 2;
-		break;
-	case LIS3DH_ACC_G_4G:
-		range = 4;
-		break;
-	case LIS3DH_ACC_G_8G:
-		range = 8;
-		break;
-	case LIS3DH_ACC_G_16G:
-		range = 16;
-		break;
-	}
-	mutex_unlock(&stat->lock);
-
-	return sprintf(buf, "%d\n", range);
-}
-
-static ssize_t attr_set_range(struct device *dev,
-			      struct device_attribute *attr,
-			      const char *buf, size_t size)
-{
-	struct lis3dh_acc_status *stat = dev_get_drvdata(dev);
-	unsigned long val;
-	u8 range;
-	int err;
-
-	if (kstrtoul(buf, 10, &val))
-		return -EINVAL;
-
-	switch (val) {
-	case 2:
-		range = LIS3DH_ACC_G_2G;
-		break;
-	case 4:
-		range = LIS3DH_ACC_G_4G;
-		break;
-	case 8:
-		range = LIS3DH_ACC_G_8G;
-		break;
-	case 16:
-		range = LIS3DH_ACC_G_16G;
-		break;
-	default:
-		dev_err(stat->dev, "invalid range request: %lu,"
-			" discarded\n", val);
-
-		return -EINVAL;
-	}
-	mutex_lock(&stat->lock);
-	err = lis3dh_acc_update_fs_range(stat, range);
-	if (err < 0) {
-		mutex_unlock(&stat->lock);
-
-		return err;
-	}
-	stat->pdata->fs_range = range;
-	mutex_unlock(&stat->lock);
-	dev_info(stat->dev, "range set to: %lu g\n", val);
-
-	return size;
-}
-
-static ssize_t attr_get_enable(struct device *dev,
-			       struct device_attribute *attr, char *buf)
-{
-	struct lis3dh_acc_status *stat = dev_get_drvdata(dev);
-	int val = atomic_read(&stat->enabled);
-
-	return sprintf(buf, "%d\n", val);
-}
-
-static ssize_t attr_set_enable(struct device *dev,
-			       struct device_attribute *attr,
-			       const char *buf, size_t size)
-{
-	struct lis3dh_acc_status *stat = dev_get_drvdata(dev);
-	unsigned long val;
-
-	if (kstrtoul(buf, 10, &val))
-		return -EINVAL;
-
-	if (val)
-		lis3dh_acc_enable(stat);
-	else
-		lis3dh_acc_disable(stat);
-
-	return size;
-}
-
-static ssize_t attr_set_intconfig1(struct device *dev,
-				   struct device_attribute *attr,
-				   const char *buf, size_t size)
-{
-	return write_reg(dev, buf, INT_CFG1, NO_MASK, RES_INT_CFG1);
-}
-
-static ssize_t attr_get_intconfig1(struct device *dev,
-				   struct device_attribute *attr, char *buf)
-{
-	return read_single_reg(dev, buf, INT_CFG1);
-}
-
-static ssize_t attr_set_duration1(struct device *dev,
-				  struct device_attribute *attr,
-				  const char *buf, size_t size)
-{
-	return write_reg(dev, buf, INT_DUR1, INT1_DURATION_MASK, RES_INT_DUR1);
-}
-
-static ssize_t attr_get_duration1(struct device *dev,
-				  struct device_attribute *attr, char *buf)
-{
-	return read_single_reg(dev, buf, INT_DUR1);
-}
-
-static ssize_t attr_set_thresh1(struct device *dev,
-				struct device_attribute *attr,
-				const char *buf, size_t size)
-{
-	return write_reg(dev, buf, INT_THS1, INT1_THRESHOLD_MASK, RES_INT_THS1);
-}
-
-static ssize_t attr_get_thresh1(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	return read_single_reg(dev, buf, INT_THS1);
-}
-
-static ssize_t attr_get_source1(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	return read_single_reg(dev, buf, INT_SRC1);
-}
-
-static ssize_t attr_set_click_cfg(struct device *dev,
-				  struct device_attribute *attr,
-				  const char *buf, size_t size)
-{
-	return write_reg(dev, buf, TT_CFG, TAP_CFG_MASK, RES_TT_CFG);
-}
-
-static ssize_t attr_get_click_cfg(struct device *dev,
-				  struct device_attribute *attr, char *buf)
-{
-	return read_single_reg(dev, buf, TT_CFG);
-}
-
-static ssize_t attr_get_click_source(struct device *dev,
-				     struct device_attribute *attr, char *buf)
-{
-	return read_single_reg(dev, buf, TT_SRC);
-}
-
-static ssize_t attr_set_click_ths(struct device *dev,
-				  struct device_attribute *attr,
-				  const char *buf, size_t size)
-{
-	return write_reg(dev, buf, TT_THS, TAP_THS_MASK, RES_TT_THS);
-}
-
-static ssize_t attr_get_click_ths(struct device *dev,
-				  struct device_attribute *attr, char *buf)
-{
-	return read_single_reg(dev, buf, TT_THS);
-}
-
-static ssize_t attr_set_click_tlim(struct device *dev,
-				   struct device_attribute *attr,
-				   const char *buf, size_t size)
-{
-	return write_reg(dev, buf, TT_LIM, TAP_TLIM_MASK, RES_TT_LIM);
-}
-
-static ssize_t attr_get_click_tlim(struct device *dev,
-				   struct device_attribute *attr, char *buf)
-{
-	return read_single_reg(dev, buf, TT_LIM);
-}
-
-static ssize_t attr_set_click_tlat(struct device *dev,
-				   struct device_attribute *attr,
-				   const char *buf, size_t size)
-{
-	return write_reg(dev, buf, TT_TLAT, TAP_TLAT_MASK, RES_TT_TLAT);
-}
-
-static ssize_t attr_get_click_tlat(struct device *dev,
-				   struct device_attribute *attr, char *buf)
-{
-	return read_single_reg(dev, buf, TT_TLAT);
-}
-
-static ssize_t attr_set_click_tw(struct device *dev,
-				 struct device_attribute *attr,
-				 const char *buf, size_t size)
-{
-	return write_reg(dev, buf, TT_TLAT, TAP_TW_MASK, RES_TT_TLAT);
-}
-
-static ssize_t attr_get_click_tw(struct device *dev,
-				 struct device_attribute *attr, char *buf)
-{
-	return read_single_reg(dev, buf, TT_TLAT);
-}
-
-static struct device_attribute attributes[] = {
-	__ATTR(pollrate_ms, 0664, attr_get_polling_rate, attr_set_polling_rate),
-	__ATTR(range, 0664, attr_get_range, attr_set_range),
-	__ATTR(enable_device, 0664, attr_get_enable, attr_set_enable),
-	__ATTR(int1_config, 0664, attr_get_intconfig1, attr_set_intconfig1),
-	__ATTR(int1_duration, 0664, attr_get_duration1, attr_set_duration1),
-	__ATTR(int1_threshold, 0664, attr_get_thresh1, attr_set_thresh1),
-	__ATTR(int1_source, 0444, attr_get_source1, NULL),
-	__ATTR(click_config, 0664, attr_get_click_cfg, attr_set_click_cfg),
-	__ATTR(click_source, 0444, attr_get_click_source, NULL),
-	__ATTR(click_threshold, 0664, attr_get_click_ths, attr_set_click_ths),
-	__ATTR(click_timelimit, 0664, attr_get_click_tlim, attr_set_click_tlim),
-	__ATTR(click_timelatency, 0664, attr_get_click_tlat,
-							attr_set_click_tlat),
-	__ATTR(click_timewindow, 0664, attr_get_click_tw, attr_set_click_tw),
-};
-
-static int create_sysfs_interfaces(struct device *dev)
-{
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(attributes); i++)
-		if (device_create_file(dev, attributes + i))
-			goto error;
-
-	return 0;
-
-error:
-	for ( ; i >= 0; i--)
-		device_remove_file(dev, attributes + i);
-	dev_err(dev, "%s:Unable to create interface\n", __func__);
-
-	return -1;
-}
-
-static int remove_sysfs_interfaces(struct device *dev)
-{
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(attributes); i++)
-		device_remove_file(dev, attributes + i);
-
-	return 0;
-}
-
-#ifdef LIS3DH_EN_OPEN_CLOSE
-static int lis3dh_acc_input_open(struct input_dev *input)
-{
-	struct lis3dh_acc_status *stat = input_get_drvdata(input);
-	/*odr=100ms range:=2G data:xyz INT*/
-	return lis3dh_acc_enable(stat);
-}
-
-static void lis3dh_acc_input_close(struct input_dev *dev)
-{
-	struct lis3dh_acc_status *stat = input_get_drvdata(dev);
-
-	lis3dh_acc_disable(stat);
-}
-#endif
 
 static int lis3dh_acc_validate_pdata(struct lis3dh_acc_status *stat)
 {
@@ -912,48 +563,6 @@ static int lis3dh_acc_validate_pdata(struct lis3dh_acc_status *stat)
 	return 0;
 }
 
-static int lis3dh_acc_input_init(struct lis3dh_acc_status *stat)
-{
-	int err;
-
-	stat->input_dev = input_allocate_device();
-	if (!stat->input_dev) {
-		dev_err(stat->dev, "input device allocation failed\n");
-		return -ENOMEM;
-	}
-
-	stat->input_dev->name = LIS3DH_ACC_DEV_NAME;
-#ifdef LIS3DH_EN_OPEN_CLOSE
-	stat->input_dev->open = lis3dh_acc_input_open;
-	stat->input_dev->close = lis3dh_acc_input_close;
-#endif
-	stat->input_dev->id.bustype = stat->bustype;
-	stat->input_dev->dev.parent = stat->dev;
-	input_set_drvdata(stat->input_dev, stat);
-
-	__set_bit(INPUT_EVENT_TYPE, stat->input_dev->evbit );
-	__set_bit(INPUT_EVENT_TIME_MSB, stat->input_dev->mscbit);
-	__set_bit(INPUT_EVENT_TIME_LSB, stat->input_dev->mscbit);
-	__set_bit(INPUT_EVENT_X, stat->input_dev->mscbit);
-	__set_bit(INPUT_EVENT_Y, stat->input_dev->mscbit);
-	__set_bit(INPUT_EVENT_Z, stat->input_dev->mscbit);
-
-	err = input_register_device(stat->input_dev);
-	if (err) {
-		dev_err(stat->dev, "unable to register input device %s\n",
-			stat->input_dev->name);
-		input_free_device(stat->input_dev);
-	}
-
-	return err;
-}
-
-static void lis3dh_acc_input_cleanup(struct lis3dh_acc_status *stat)
-{
-	input_unregister_device(stat->input_dev);
-	input_free_device(stat->input_dev);
-}
-
 static irqreturn_t lis3dh_acc_save_timestamp(int irq, void *private)
 {
 	struct lis3dh_acc_status *stat = (struct lis3dh_acc_status *)private;
@@ -966,19 +575,13 @@ static irqreturn_t lis3dh_acc_save_timestamp(int irq, void *private)
 
 static irqreturn_t lis3dh_acc_thread_fn(int irq, void *private)
 {
-	int err, xyz[3] = {};
-        unsigned char data = 0;
+    unsigned char data = 0;
 	struct lis3dh_acc_status *stat = (struct lis3dh_acc_status *)private;
 
 	mutex_lock(&stat->lock);
-        //clear irq
-        stat->tf->read(stat, INT_SRC1, 1, &data);
-         
-	err = lis3dh_acc_get_acceleration_data(stat, xyz);
-	if (err < 0)
-		dev_err(stat->dev, "get_acceleration_data failed\n");
-	else
-		lis3dh_acc_report_values(stat, xyz, stat->timestamp);
+    //clear irq
+    stat->tf->read(stat, INT_SRC1, 1, &data);
+    wake_up_interruptible(&stat->drv_waitq);
 
 	mutex_unlock(&stat->lock);
 
@@ -986,20 +589,182 @@ static irqreturn_t lis3dh_acc_thread_fn(int irq, void *private)
 	return IRQ_HANDLED;
 }
 
+static int drv_open(struct inode * inode, struct file * filp)  
+{
+    int ret = 0;
+    int irq = 0;
+
+    if(NULL == lis3dh_ptr)
+    {
+        ret = -ENOMEM;
+        goto error;
+    }
+
+    if(!atomic_dec_and_test(&lis3dh_ptr->opened))
+    {
+        ret = -EBUSY;
+        goto error; 
+    }
+        
+    irq = lis3dh_ptr->irq;
+    
+	ret = request_threaded_irq(irq, lis3dh_acc_save_timestamp, lis3dh_acc_thread_fn,
+                                  IRQF_TRIGGER_HIGH, lis3dh_ptr->name, lis3dh_ptr);
+	if (ret < 0)
+		goto error;
+
+	disable_irq_nosync(irq);
+
+error:
+    
+    return ret;  
+}  
+  
+static ssize_t drv_read(struct file *file, char __user *user, size_t size,loff_t *ppos)  
+{
+    int ret = 0;
+    int xyz[3] = {0};
+    
+    wait_event_interruptible(lis3dh_ptr->drv_waitq, (lis3dh_ptr->drv_dataflag == 1));
+    lis3dh_ptr->drv_dataflag = 0;
+    
+    mutex_lock(&lis3dh_ptr->lock);
+    
+    ret = lis3dh_acc_get_acceleration_data(lis3dh_ptr, xyz);
+	if (ret < 0)
+		dev_err(lis3dh_ptr->dev, "get_acceleration_data failed\n");
+	else{
+       	put_user(xyz[0], user);
+    	put_user(xyz[0], (user + 4));
+    	put_user(xyz[0], (user + 8));
+        ret = 12;
+    }
+    
+    mutex_unlock(&lis3dh_ptr->lock);
+    
+    return ret;
+}  
+static ssize_t drv_write(struct file *file, const char __user *buf, size_t count, loff_t *f_pos)
+{
+    int ret = 0;
+    
+    return ret;  
+}
+ 
+static int drv_release(struct inode *inode, struct file *file)  
+{
+    free_irq(lis3dh_ptr->irq, (void *)lis3dh_ptr);
+    
+    atomic_inc(&lis3dh_ptr->opened);
+    return 0;  
+}
+
+static long drv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    int ret = 0;
+
+    switch(cmd){
+        case SET_ODR:
+        {
+            unsigned long interval_ms = arg;
+            mutex_lock(&lis3dh_ptr->lock);
+        	lis3dh_ptr->pdata->poll_interval = interval_ms;
+        	lis3dh_acc_update_odr(lis3dh_ptr, interval_ms);
+        	mutex_unlock(&lis3dh_ptr->lock);
+            break;
+        }
+        case SET_FS:
+        {
+        	u8 range = (u8)arg;
+
+        	switch (range) {
+        	case 2:
+        		range = LIS3DH_ACC_G_2G;
+        		break;
+        	case 4:
+        		range = LIS3DH_ACC_G_4G;
+        		break;
+        	case 8:
+        		range = LIS3DH_ACC_G_8G;
+        		break;
+        	case 16:
+        		range = LIS3DH_ACC_G_16G;
+        		break;
+        	default:
+        		dev_err(lis3dh_ptr->dev, "invalid range request: %u, discarded\n", range);
+
+        		return -EINVAL;
+        	}
+        	mutex_lock(&lis3dh_ptr->lock);
+        	ret = lis3dh_acc_update_fs_range(lis3dh_ptr, range);
+        	if (ret < 0) {
+        		mutex_unlock(&lis3dh_ptr->lock);
+
+        		return ret;
+        	}
+        	lis3dh_ptr->pdata->fs_range = range;
+        	mutex_unlock(&lis3dh_ptr->lock);
+            break;
+        }
+        case SET_ENABLE:
+        {
+            if(arg)
+            {
+                lis3dh_acc_enable(lis3dh_ptr);
+            }else{
+                lis3dh_acc_disable(lis3dh_ptr);
+            }
+            break;
+        }        
+    }
+    
+    return ret;
+}
+
+static unsigned int drv_poll(struct file *file, poll_table *wait)  
+{  
+    unsigned int mask = 0;  
+   
+    poll_wait(file, &lis3dh_ptr->drv_waitq, wait);  
+  
+    if(1 == lis3dh_ptr->drv_dataflag)  
+    {  
+        mask |= POLLIN | POLLRDNORM; 
+    }  
+    
+    return mask;    
+}
+
+
+/* File operations struct for character device */  
+static const struct file_operations drv_fops = {  
+    .owner      = THIS_MODULE,
+    .open       = drv_open,
+    .read       = drv_read,
+    .write      = drv_write,
+    .release    = drv_release,
+    .unlocked_ioctl = drv_ioctl,
+    .poll       = drv_poll,
+};  
+
+
 /*
  * struct lis3dh_acc_status *stat is allocated/freed in tf probing
  * so let it manage this stuff
  */
 int lis3dh_acc_probe(struct lis3dh_acc_status *stat, int irq)
 {
+
 	int err = -1;
 	u8 wai = 0;
 
+    printk(KERN_ERR "%s-V%d.%d\n", stat->name, DRIVER_VER1, DRIVER_VER2);
 	dev_info(stat->dev, "probe start.\n");
 
 	mutex_init(&stat->lock);
 	mutex_init(&stat->tb.buf_lock);
-
+    init_waitqueue_head(&stat->drv_waitq);
+    stat->drv_dataflag = 0;
 	/* Check device ID and bus connection */
 	err = stat->tf->read(stat, WHO_AM_I, 1, &wai);
 	if (err < 0) {
@@ -1052,23 +817,23 @@ int lis3dh_acc_probe(struct lis3dh_acc_status *stat, int irq)
 	}
 
 	memset(stat->resume_state, 0, ARRAY_SIZE(stat->resume_state));
-        /*enable xyz axis*/
+    /*enable xyz axis*/
 	stat->resume_state[RES_CTRL_REG1] = (ALL_ZEROES |
 					     LIS3DH_ACC_ENABLE_ALL_AXES);
-        /*data from internal filter send to output, High-pass filter on interrupt 1*/
+    /*data from internal filter send to output, High-pass filter on interrupt 1*/
 	stat->resume_state[RES_CTRL_REG2] = (LIS3DH_ACC_FDS | LIS3DH_ACC_HP_IA1);
-        /*enable AOI interrupt 1*/
+    /*enable AOI interrupt 1*/
 	stat->resume_state[RES_CTRL_REG3] = LIS3DH_ACC_I1_IA1;
-        /*output registers not updated until MSB and LSB reading*/
+    /*output registers not updated until MSB and LSB reading*/
 	stat->resume_state[RES_CTRL_REG4] = (ALL_ZEROES | CTRL_REG4_BDU_ENABLE);
-        /*interupt latched*/
+    /*interupt latched*/
 	stat->resume_state[RES_CTRL_REG5] = (ALL_ZEROES | CTRL_REG5_LIR_INT1);
 	
-        /*the thresold value of interrupt 16*16 mg*/
-        stat->resume_state[RES_INT_THS1] = (ALL_ZEROES | 0xF);
+    /*the thresold value of interrupt 16*16 mg*/
+    stat->resume_state[RES_INT_THS1] = (ALL_ZEROES | 0xF);
         
-        /**/
-        stat->resume_state[RES_INT_CFG1] = (ALL_ZEROES | LIS3DH_ACC_ZL | LIS3DH_ACC_YL | LIS3DH_ACC_XL);
+    /**/
+    stat->resume_state[RES_INT_CFG1] = (ALL_ZEROES | LIS3DH_ACC_ZL | LIS3DH_ACC_YL | LIS3DH_ACC_XL);
 
 
 	err = lis3dh_acc_device_power_on(stat);
@@ -1090,37 +855,37 @@ int lis3dh_acc_probe(struct lis3dh_acc_status *stat, int irq)
 		dev_err(stat->dev, "update_odr failed\n");
 		goto  err_power_off;
 	}
-	
-	err = lis3dh_acc_input_init(stat);
-	if (err < 0) {
-		dev_err(stat->dev, "input init failed\n");
-		goto err_power_off;
-	}
 
-	err = create_sysfs_interfaces(stat->dev);
-	if (err < 0) {
-		dev_err(stat->dev,
-			"device LIS3DH_ACC_DEV_NAME sysfs register failed\n");
-		goto err_input_cleanup;
-	}
+    //allocate the char device
+    stat->drv_dev_num = MKDEV(DRV_MAJOR, 0);
+    err = register_chrdev_region (stat->drv_dev_num, DRV_MINOR, stat->name);
+    if (err){
+        goto error;
+    }
 
+    //register the char device
+    cdev_init(&stat->drv_cdev, &drv_fops);
+    stat->drv_cdev.owner = THIS_MODULE;
+    err = cdev_add(&stat->drv_cdev, stat->drv_dev_num, DRV_MINOR);
+    if (err) {
+        goto error;
+    }
+    
+    //create device node
+    stat->drv_class = class_create(THIS_MODULE, stat->name);
+    if (stat->drv_class == NULL) {
+        err = -ENOMEM;
+        goto error;
+    }
+
+    device_create(stat->drv_class, NULL, stat->drv_dev_num, NULL, stat->name);
+    
 	lis3dh_acc_device_power_off(stat);
 
 	/* As default, do not report information */
 	atomic_set(&stat->enabled, 0);
 
-	if (irq > 0) {
-		stat->irq = irq;
-
-		err = request_threaded_irq(irq, lis3dh_acc_save_timestamp,
-					   lis3dh_acc_thread_fn,
-					   IRQF_TRIGGER_HIGH, stat->name,
-					   stat);
-		if (err < 0)
-			goto err_remove_sysfs_int;
-
-		disable_irq_nosync(irq);
-	}
+    atomic_set(&stat->opened, 1);
 
 	mutex_unlock(&stat->lock);
 
@@ -1128,10 +893,7 @@ int lis3dh_acc_probe(struct lis3dh_acc_status *stat, int irq)
 
 	return 0;
 
-err_remove_sysfs_int:
-	remove_sysfs_interfaces(stat->dev);
-err_input_cleanup:
-	lis3dh_acc_input_cleanup(stat);
+error:
 err_power_off:
 	lis3dh_acc_device_power_off(stat);
 err_pdata_init:
@@ -1152,15 +914,21 @@ int lis3dh_acc_remove(struct lis3dh_acc_status *stat)
 	dev_info(stat->dev, "driver removing\n");
 
 	lis3dh_acc_disable(stat);
-	lis3dh_acc_input_cleanup(stat);
 
-	remove_sysfs_interfaces(stat->dev);
+    device_destroy(stat->drv_class, stat->drv_dev_num);
+    class_destroy(stat->drv_class);
+    cdev_del(&stat->drv_cdev);
+    unregister_chrdev_region(stat->drv_dev_num, DRV_MINOR);
+	//lis3dh_acc_input_cleanup(stat);
+
+	//remove_sysfs_interfaces(stat->dev);
 
 	if (stat->pdata->exit)
 		stat->pdata->exit();
 	kfree(stat->pdata);
 	kfree(stat);
 
+    lis3dh_ptr = NULL;
 	return 0;
 }
 EXPORT_SYMBOL(lis3dh_acc_remove);

@@ -42,6 +42,9 @@ Version History.
 
 #ifndef	__LIS3DH_H__
 #define	__LIS3DH_H__
+#include <linux/types.h>//dev_t
+#include <linux/cdev.h>//char device register
+#include <linux/device.h>//class_create
 
 /* Uncomment if want enable/disable on open/close input device */
 //#define LIS3DH_EN_OPEN_CLOSE
@@ -114,14 +117,20 @@ struct lis3dh_acc_transfer_function {
 
 struct lis3dh_acc_status {
 	const char *name;
+    atomic_t opened;
 	struct lis3dh_acc_platform_data *pdata;
 
 	struct mutex lock;
-	struct input_dev *input_dev;
+	//struct input_dev *input_dev;
+	dev_t drv_dev_num;
+    struct cdev drv_cdev;
+    struct class *drv_class;
 
 	int hw_initialized;
 	/* hw_working=-1 means not tested yet */
 	int hw_working;
+    u8 drv_dataflag;
+    wait_queue_head_t drv_waitq;
 	atomic_t enabled;
 	int on_before_suspend;
 	int use_smbus;
